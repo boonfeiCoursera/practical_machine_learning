@@ -1,0 +1,227 @@
+---
+title: "Practical Machine Learning - Prediction Assignment Writeup"
+author: "Boon Fei Yong"
+output: html_document
+---
+### Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+### Preparing the data and R library
+
+#### Load needed packages 
+
+```{r, message=FALSE}
+require(caret)
+require(xgboost)
+require(corrplot)
+require(Rtsne)
+require(stats)
+require(knitr)
+require(ggplot2)
+knitr::opts_chunk$set(cache=TRUE)
+```
+The caret package (short for Classification And REgression Training) is a set of functions that attempt to streamline the process for creating predictive models while xgboost is extreme gradient boosting, which is an efficient implementation of gradient boosting framework.The rest of the packages are needed to support the plotting and prediction.
+
+#### Getting and Storing Data
+```{r}
+#Define data and folder to store the data
+if (!file.exists("./data")) {
+  dir.create("./data")
+}
+train.url ="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test.url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+train.name = "./data/pml-training.csv"
+test.name = "./data/pml-testing.csv"
+
+if (!file.exists(train.name)) {
+  download.file(train.url, destfile=train.name, method="curl")
+}
+if (!file.exists(test.name)) {
+  download.file(test.url, destfile=test.name, method="curl")
+}
+# load the CSV files into data frame.
+train = read.csv("./data/pml-training.csv")
+test = read.csv("./data/pml-testing.csv")
+dim(train)
+dim(test)
+head(train)
+```  
+
+The raw training data has 19622 rows of observations and 160 features (predictors) while the testing set has 20 rows of observations and 160 features. The 160 features are columns such as user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp and etc (please refer to the header above)
+
+#### Data cleaning
+
+classe is the outcome that we are going to use as preditors. 
+```{r}
+outcome.org = train[, "classe"]
+outcome = outcome.org 
+levels(outcome)
+```
+Outcome has 5 levels in character , A, B, C, D, and E.
+XGBoost gradient booster only works with numerical levels, so the characters are converted to numerical format.   
+```{r}
+num.class = length(levels(outcome))
+levels(outcome) = 1:num.class
+head(outcome)
+```
+
+We will only use data collected from `belt`, `forearm`, `arm`, and `dumbell`, so the keyword are use as filter to the testing and training data. All NA data are removed as well.
+  
+```{r}
+train$classe = NULL
+filter = grepl("belt|arm|dumbell", names(train))
+train = train[, filter]
+test = test[, filter]
+cols.without.na = colSums(is.na(test)) == 0
+train = train[, cols.without.na]
+test = test[, cols.without.na]
+```
+
+### Preparation for machine learning...
+
+#### Check for features's variance
+
+Zero variance training data will be removed.
+```{r}
+# check for zero variance
+zero.var = nearZeroVar(train, saveMetrics=TRUE)
+zero.var
+```
+From the above checking, there is no zero variance data. 
+
+#### Expection of features and predictors.
+
+```{r fig.width=12, fig.height=8, dpi=72}
+featurePlot(train, outcome.org, "strip")
+```
+
+#### Plot of correlation matrix  
+
+```{r fig.width=12, fig.height=12, dpi=72}
+corrplot.mixed(cor(train), lower="circle", upper="color", 
+               tl.pos="lt", diag="n", order="hclust", hclust.method="complete")
+```
+The correlation matrix plot shows the data is not highly correlated.
+
+### Machine learning model 
+
+XGBoost extreme gradient boosting algorithm is used to build the machine learning model to train the classe(outcome)
+
+#### XGBoost data
+
+First the training data is converted to the numerical matrix.
+```{r}
+
+train.matrix = as.matrix(train)
+mode(train.matrix) = "numeric"
+test.matrix = as.matrix(test)
+mode(test.matrix) = "numeric"
+y = as.matrix(as.integer(outcome)-1)
+```
+
+#### XGBoost parameters 
+
+Some XGBoost parameters are separated for cross validation and training.  
+Set a multiclass classification objective as the gradient boosting's learning function.   
+Set evaluation metric to `merror`, multiclass error rate. Please refer to https://cran.r-project.org/web/packages/xgboost/xgboost.pdf for the parameters used.
+
+```{r}
+# xgboost parameters
+param <- list("objective" = "multi:softprob",    
+              "num_class" = num.class,   
+              "eval_metric" = "merror",    
+              "nthread" = 8,   
+              "max_depth" = 16,    
+              "eta" = 0.3,    
+              "gamma" = 0,   
+              "subsample" = 1,   
+              "colsample_bytree" = 1,  
+              "min_child_weight" = 12  
+              )
+```
+
+#### Expected error rate 
+
+Expected error rate is less than `1%` for a good classification. 200 epoch 4 k-fold cross validation is performed.
+
+#### 4-fold cross validation  
+
+```{r}
+set.seed(5566)
+nround.cv = 200
+system.time( bst.cv <- xgb.cv(param=param, data=train.matrix, label=y, 
+              nfold=4, nrounds=nround.cv, prediction=TRUE, verbose=FALSE) )
+```
+
+Elapsed time is around 127.8 seconds, just about 2 minutes.  
+
+From the cross validation, minimum multiclass error rate will be used in the model training to fulfill expected minimum error rate of `< 1%`.  
+```{r}
+# index of minimum merror
+min.merror.idx = which.min(bst.cv$dt[, test.merror.mean]) 
+min.merror.idx 
+# minimum merror
+bst.cv$dt[min.merror.idx,]
+```
+Best cross-validation's minimum error rate `test.merror.mean` is around 0.005402 (0.54%), happened at 187th iteration.   
+
+#### Confusion matrix 
+
+Cross validation of the prediction model and the outcome. 
+
+```{r}
+pred.cv = matrix(bst.cv$pred, nrow=length(bst.cv$pred)/num.class, ncol=num.class)
+pred.cv = max.col(pred.cv, "last")
+confusionMatrix(factor(y+1), factor(pred.cv))
+```
+
+Confusion matrix shows concentration of correct predictions is on the diagonal.  
+  
+The average accuracy is `99.44%`, with error rate is `0.56%`. So the error rate of less than 1% is archieved. 
+
+#### Model training 
+
+XGBoost gradient boosting model is used on all the training data   
+```{r}
+system.time( bst <- xgboost(param=param, data=train.matrix, label=y, 
+                           nrounds=min.merror.idx, verbose=0) )
+```
+Time elapsed is around 42 seconds.  
+
+#### Predicting the testing data
+
+```{r}
+# xgboost predict test data using the trained model
+pred <- predict(bst, test.matrix)  
+head(pred, 10)  
+```
+
+#### Post-processing
+
+Output of prediction is the predicted probability of the 5 levels (columns) of outcome.  
+The 5 level index is converted to the character that represent the outcome class.   
+  
+```{r}
+pred = matrix(pred, nrow=num.class, ncol=length(pred)/num.class)
+pred = t(pred)
+pred = max.col(pred, "last")
+pred.char = toupper(letters[pred])
+```
+
+#### Feature importance
+
+```{r fig.width=8, fig.height=12, dpi=72}
+# get the trained model
+model = xgb.dump(bst, with.stats=TRUE)
+# get the feature real names
+names = dimnames(train.matrix)[[2]]
+# compute feature importance matrix
+importance_matrix = xgb.importance(names, model=bst)
+
+# plot
+gp = xgb.plot.importance(importance_matrix)
+print(gp) 
+```
+
+
+
